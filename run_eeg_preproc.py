@@ -1,0 +1,647 @@
+import mne
+import os
+import matplotlib
+matplotlib.use('Agg')  # non-interactive backend so figures don't pop up during report building
+import matplotlib.pyplot as plt
+from mne.preprocessing import ICA
+from autoreject import AutoReject
+import numpy as np
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+subject_id    = "S001"
+recording_str = "0403_125105"
+data_path     = "~/csharp_data"
+
+# ── Step toggles ──────────────────────────────────────────────────────────────
+DO_FILTERING          = True
+DO_BAD_CHANNELS       = True
+DO_ICA                = False   # set True to run ICA
+DO_REREFERENCING      = True
+DO_EPOCHING           = True
+DO_ARTIFACT_REJECTION = True
+DO_SSVEP_PSD          = True
+
+# ── Output toggles ────────────────────────────────────────────────────────────
+SAVE_REPORT  = True   # write the HTML report to disk
+SHOW_FIGURES = False  # pop up interactive windows (requires an interactive backend)
+
+# ── Filter cutoffs ────────────────────────────────────────────────────────────
+FILTER_HIGH = 0.5   # high-pass cutoff (Hz) → l_freq; removes slow drifts
+FILTER_LOW  = 85    # low-pass  cutoff (Hz) → h_freq; removes high-freq noise
+
+# ── Bad channels (set before running) ─────────────────────────────────────────
+BAD_CHANNELS = ['E17']
+INTERPOLATE_BADS = True
+
+# ── ICA settings ──────────────────────────────────────────────────────────────
+ICA_N_COMPONENTS  = 25
+ICA_EXCLUDE_COMPS = [13]     # component indices to remove
+ICA_EOG_PROXY_CH  = 'E25'   # frontal channel used as EOG proxy
+
+# ── Epoching ──────────────────────────────────────────────────────────────────
+EPOCH_TMIN = 0.0
+EPOCH_TMAX = 2.0
+# core_only=False (default): include prelude + postlude labeled as
+# 'noise/prelude' and 'noise/postlude' alongside core bins 'bin/0'–'bin/4'.
+# core_only=True: only the 5 core bins (original behaviour).
+EPOCH_CORE_ONLY = False
+
+# ── Artifact rejection ────────────────────────────────────────────────────────
+# 'autoreject'  — recommended default: data-driven per-channel thresholds,
+#                 interpolates bad channel-epochs before dropping whole epochs
+# 'peak_to_peak' — simple fixed-threshold drop (fast but arbitrary, no interpolation)
+# 'both'         — peak-to-peak coarse pass first, then AutoReject on survivors
+ARTIFACT_REJECTION_METHOD = 'peak_to_peak'
+PEAK_TO_PEAK_THRESH = 120e-6   # volts; only used when method is 'peak_to_peak' or 'both'
+
+# ── Raw clean I/O ─────────────────────────────────────────────────────────────
+# Saves cleaned continuous data after re-referencing (before epoching).
+# Useful checkpoint: re-run epoching/rejection without redoing filtering/ICA.
+SAVE_RAW_CLEAN           = True
+LOAD_RAW_CLEAN_IF_EXISTS = False   # set False to force re-run from raw
+
+# ── Epochs I/O ───────────────────────────────────────────────────────────────
+# SAVE_EPOCHS      — write clean epochs to disk after artifact rejection
+# LOAD_EPOCHS_IF_EXISTS — if the file already exists, skip raw→epochs pipeline
+#                         and load directly (avoids re-running AutoReject, etc.)
+SAVE_EPOCHS           = True
+LOAD_EPOCHS_IF_EXISTS = False   # set False to force a full re-run
+
+# ── Occipital channels for SSVEP ──────────────────────────────────────────────
+OCCIPITAL_REGEXP = r'E8[1-4]|E8[8-9]|E90|E91|E94|E95' # right hemi occipital channels
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _add_fig(report, fig, title, section):
+    """Add a figure to the report and optionally display it."""
+    if report is not None:
+        report.add_figure(fig, title=title, section=section)
+    if SHOW_FIGURES:
+        plt.show()
+    plt.close(fig)
+
+
+def _close_figs(figs):
+    for f in (figs if isinstance(figs, list) else [figs]):
+        plt.close(f)
+
+def plot_fft_histogram(epochs, picks=None, fmax=80,
+                       target_freqs=[10, 12, 15, 20, 24, 30, 36, 40, 45, 48, 60],
+                       title='FFT Amplitude Histogram'):
+    """
+    Plot FFT amplitude spectrum at native frequency resolution.
+
+    average complex FFT values across epochs + channels
+    """
+    picks = picks or 'eeg'
+    data = epochs.get_data(picks=picks)   # (n_epochs, n_channels, n_times)
+    sfreq = epochs.info['sfreq']
+    n_times = data.shape[-1]
+
+    freqs = np.fft.rfftfreq(n_times, d=1. / sfreq)   # native frequency bins
+
+    # Average complex FFT first → then amplitude (noise cancels, signal survives)
+    complex_fft = np.fft.rfft(data, axis=-1)          # (n_epochs, n_channels, n_freqs)
+    mean_amp = np.abs(complex_fft.mean(axis=(0, 1))) * 1e6   # V → µV
+
+    # Trim to fmax
+    mask = freqs <= fmax
+    plot_freqs = freqs[mask]
+    plot_amp   = mean_amp[mask]
+
+    freq_res = freqs[1] - freqs[0]   # bin width (e.g. 0.5 Hz for 2 s epochs)
+
+    fig, ax = plt.subplots(figsize=(14, 5))
+    ax.bar(plot_freqs, plot_amp, width=freq_res * 0.9,
+           color='steelblue', alpha=0.7, align='center')
+
+    for f in (target_freqs or []):
+        ax.axvline(f, color='red', linestyle='--', alpha=0.7, linewidth=1.2, label=f'{f} Hz')
+
+    # Label every 5 Hz on the x-axis; target lines mark the exact frequencies
+    tick_step = 5
+    ax.set_xticks(np.arange(0, fmax + tick_step, tick_step))
+    ax.set(xlabel='Frequency (Hz)', ylabel='Amplitude (µV)',
+           title=title, xlim=[-freq_res / 2, fmax + freq_res])
+    plt.tight_layout()
+    return fig, ax
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 1 · Raw Data
+# ══════════════════════════════════════════════════════════════════════════════
+
+def report_raw(raw, report=None):
+    """Add raw data visualisations to the report."""
+    sec = '1 · Raw Data'
+
+    if report is not None:
+        report.add_raw(raw, title='Raw Data', psd=True, butterfly=False)
+
+    # Sensor layout
+    fig = raw.plot_sensors(show_names=True, show=False)
+    _add_fig(report, fig, 'Sensor Layout', sec)
+
+    # Per-channel variance — outliers → bad channels
+    data, _ = raw.get_data(return_times=True)
+    chan_var = np.var(data, axis=1)
+    eeg_idx  = mne.pick_types(raw.info, eeg=True)
+    fig, ax  = plt.subplots(figsize=(14, 4))
+    ax.bar(range(len(eeg_idx)), chan_var[eeg_idx], width=1.0)
+    ax.set_xlabel('Channel index')
+    ax.set_ylabel('Variance (V²)')
+    ax.set_title('Per-channel variance (EEG only) — outliers → bad channels')
+    plt.tight_layout()
+    _add_fig(report, fig, 'Channel Variance', sec)
+
+    # Events summary
+    events = mne.find_events(raw, verbose=False)
+    fig, ax = plt.subplots(figsize=(10, 3))
+    mne.viz.plot_events(events, sfreq=raw.info['sfreq'],
+                        first_samp=raw.first_samp, axes=ax, show=False)
+    plt.tight_layout()
+    _add_fig(report, fig, 'All Events', sec)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 2 · Filtering
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_filtering(raw, l_freq=0.5, h_freq=70, report=None):
+    """Bandpass + 60 Hz notch filter.  Returns filtered raw.
+
+    Parameters
+    ----------
+    l_freq : float
+        High-pass cutoff (Hz).  Removes slow drifts below this frequency.
+    h_freq : float
+        Low-pass cutoff (Hz).  Removes high-frequency noise above this frequency.
+    """
+    sec = '2 · Filtering'
+    filter_label = f'{l_freq}–{h_freq} Hz + 60 Hz notch'
+
+    if report is not None:
+        # PSD before filtering
+        n_fft = int(raw.info['sfreq'] * 10)
+        fig_pre = raw.compute_psd(fmin=0, fmax=h_freq, picks='eeg', n_fft=n_fft).plot(
+            average=False, spatial_colors=True, show=False)
+        _add_fig(report, fig_pre, 'PSD — Before Filtering', sec)
+
+    raw_fil = raw.copy().filter(l_freq=l_freq, h_freq=h_freq)
+    raw_fil.notch_filter(freqs=60)
+
+    if report is not None:
+        n_fft = int(raw.info['sfreq'] * 10)
+        # PSD after filtering
+        fig_post = raw_fil.compute_psd(fmin=0, fmax=h_freq, picks='eeg', n_fft=n_fft).plot(
+            average=False, spatial_colors=True, show=False)
+        _add_fig(report, fig_post, f'PSD — After Filtering ({filter_label})', sec)
+
+
+    return raw_fil
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 3 · Bad Channels
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_bad_channels(raw, bad_channels, interpolate=True, report=None):
+    """Mark bad channels, optionally interpolate them, and visualise.
+
+    Interpolation (spherical spline) reconstructs the bad channel from its
+    neighbors so it contributes a valid signal to the average reference.
+    Should be done before re-referencing.  Returns raw (in-place).
+    """
+    sec = '3 · Bad Channels'
+    raw.info['bads'] = bad_channels
+
+    if report is not None:
+        fig = raw.plot_sensors(show_names=True, show=False)
+        _add_fig(report, fig, 'Sensor Layout — Bad Channels Marked (red)', sec)
+
+    if interpolate and bad_channels:
+        raw.interpolate_bads(reset_bads=True)   # reset_bads clears info['bads'] after interpolation
+        print(f"Interpolated {len(bad_channels)} bad channel(s): {bad_channels}")
+
+    return raw
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 4 · ICA
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_ica(raw, exclude_comps, eog_proxy_ch, n_components=25, report=None):
+    """Fit ICA, inspect components, apply to raw.  Returns cleaned raw copy."""
+    sec = '4 · ICA'
+
+    ica = ICA(n_components=n_components, method='fastica', random_state=42)
+    ica.fit(raw)
+
+    if report is not None:
+        # Topographic maps of all components
+        figs_comp = ica.plot_components(show=False)
+        figs_comp = figs_comp if isinstance(figs_comp, list) else [figs_comp]
+        for i, fig in enumerate(figs_comp):
+            _add_fig(report, fig, f'ICA Components (page {i + 1})', sec)
+
+        # Properties of each excluded component
+        figs_prop = ica.plot_properties(raw, picks=exclude_comps, show=False)
+        figs_prop = figs_prop if isinstance(figs_prop, list) else [figs_prop]
+        for i, fig in enumerate(figs_prop):
+            _add_fig(report, fig,
+                     f'ICA Component {exclude_comps[i % len(exclude_comps)]} Properties', sec)
+
+        # EOG scores
+        _, eog_scores = ica.find_bads_eog(raw, ch_name=eog_proxy_ch)
+        fig_scores = ica.plot_scores(eog_scores, show=False)
+        _add_fig(report, fig_scores,
+                 f'ICA EOG Scores (proxy: {eog_proxy_ch})', sec)
+
+    ica.exclude = exclude_comps
+
+    if report is not None:
+        # Overlay before vs after
+        fig_ov = ica.plot_overlay(raw, exclude=ica.exclude, show=False)
+        _add_fig(report, fig_ov,
+                 'ICA Overlay — Before vs After Artifact Removal', sec)
+
+    raw_clean = raw.copy()
+    ica.apply(raw_clean)
+    return raw_clean
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 4 · Re-referencing
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_rereferencing(raw, report=None):
+    """Apply average reference.  Returns raw (in-place)."""
+    raw.set_eeg_reference('average', projection=True)
+    raw.apply_proj()
+
+    if report is not None:
+        sec = '4 · Re-referencing'
+        n_fft = int(raw.info['sfreq'] * 10)
+        fig = raw.compute_psd(fmin=0, fmax=50, picks='eeg', n_fft=n_fft).plot(
+            average=False, spatial_colors=True, show=False)
+        _add_fig(report, fig, 'PSD — After Re-referencing', sec)
+
+    return raw
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 5 · Epoching
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_epoching(raw, raw_clean, tmin, tmax, core_only=False, report=None):
+    """Build epochs from DIN4/DIN5 events.  Returns Epochs object.
+
+    Trial structure (each segment is bin_duration seconds):
+        DIN4 ── prelude ── DIN5[0..4] (5 core bins) ── DIN5[5] postlude ── DIN5[6] ISI …
+
+    Event IDs
+    ---------
+    bin/0 … bin/4  : 0–4   core stimulus bins (always included)
+    noise/prelude  : 5     pre-stimulus period (DIN4 → DIN5[0])
+    noise/postlude : 6     post-stimulus period (DIN5[5] → DIN5[6])
+
+    Parameters
+    ----------
+    core_only : bool
+        False (default) — include prelude + postlude epochs labeled as
+        'noise/prelude' / 'noise/postlude' so ``epochs['noise']`` selects
+        both for noise-covariance estimation.
+        True — only 'bin/0'–'bin/4' (original behaviour).
+    """
+    sec = '5 · Epoching'
+    sfreq = raw_clean.info['sfreq']
+
+    # Compute tmax so the epoch contains exactly the intended number of samples.
+    # Floating-point arithmetic (e.g. 2.0 - 1/1000) can land a hair above or
+    # below a sample boundary, causing MNE to produce n±1 samples.  Rounding
+    # in sample space first and converting back avoids this.
+    n_samples  = int(round((tmax - tmin) * sfreq))   # e.g. 2000
+    tmax_exact = tmin + (n_samples - 1) / sfreq      # last sample, no rounding error
+
+    din4_events = mne.find_events(raw, stim_channel='DIN4')   # trial starts
+    din5_events = mne.find_events(raw, stim_channel='DIN5')   # bin onsets
+
+    din4_samples = din4_events[:, 0]
+    din5_samples = din5_events[:, 0]
+
+    event_id = {
+        'bin/0': 0, 'bin/1': 1, 'bin/2': 2, 'bin/3': 3, 'bin/4': 4,
+        'noise/prelude':  5,
+        'noise/postlude': 6,
+    }
+
+    all_events = []
+    for i, trial_start in enumerate(din4_samples):
+        trial_end       = din4_samples[i + 1] if i + 1 < len(din4_samples) else np.inf
+        dins_in_trial   = din5_samples[(din5_samples >= trial_start) &
+                                       (din5_samples <  trial_end)]
+
+        # Core bins: DIN5 positions 0–4 → event IDs 0–4
+        for pos, s in enumerate(dins_in_trial[:5]):
+            all_events.append([s, 0, pos])
+
+        if not core_only:
+            # Prelude: epoch anchored at DIN4, lasts bin_duration seconds
+            if len(dins_in_trial) >= 1:
+                all_events.append([trial_start, 0, 5])
+
+            # Postlude: DIN5[5] (6th pulse, 0-based index 5) → DIN5[6] onset
+            # DIN5[6] is the ISI — we do NOT epoch it, just use [5] as anchor
+            if len(dins_in_trial) >= 6:
+                all_events.append([dins_in_trial[5], 0, 6])
+
+    all_events = np.array(all_events)
+    all_events = all_events[np.argsort(all_events[:, 0])]   # sort by sample
+
+    epochs = mne.Epochs(raw_clean, all_events, event_id=event_id,
+                        tmin=tmin, tmax=tmax_exact,
+                        baseline=None, preload=True)
+
+    if report is not None:
+        # Report figures are computed on core bins only for interpretability
+        core_epochs = epochs['bin']
+
+        # Butterfly + topomaps at peak time points
+        figs_avg = core_epochs.average().plot_joint(show=False)
+        figs_avg = figs_avg if isinstance(figs_avg, list) else [figs_avg]
+        for fig in figs_avg:
+            _add_fig(report, fig, 'Epoch Average — Before Rejection (core bins)', sec)
+
+        fig_epsd = core_epochs.compute_psd(fmin=0, fmax=50, method='welch',
+                                           n_fft=len(core_epochs.times)).plot(show=False)
+        _add_fig(report, fig_epsd, 'Epochs PSD (0–50 Hz)', sec)
+
+    return epochs
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 6 · Artifact Rejection
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _reject_peak_to_peak(epochs, thresh, report=None, sec='6 · Artifact Rejection'):
+    """Drop epochs exceeding a fixed peak-to-peak amplitude threshold."""
+    epochs_out = epochs.copy()
+    epochs_out.drop_bad(reject=dict(eeg=thresh))
+
+    print(f"Peak-to-peak: dropped {len(epochs) - len(epochs_out)} / {len(epochs)} epochs "
+          f"(threshold ±{int(thresh * 1e6)} µV)")
+
+    if report is not None:
+        fig = epochs_out.plot_drop_log(show=False)
+        _add_fig(report, fig,
+                 f'Drop Log — Peak-to-Peak (±{int(thresh * 1e6)} µV)', sec)
+
+    return epochs_out
+
+
+def _reject_autoreject(epochs, report=None, sec='6 · Artifact Rejection'):
+    """Data-driven rejection and interpolation via AutoReject."""
+    ar = AutoReject()
+    epochs_out, reject_log = ar.fit_transform(epochs, return_log=True)
+
+    labels           = reject_log.labels
+    n_interpolated   = (labels == 1).sum()
+    n_epochs_dropped = reject_log.bad_epochs.sum()
+
+    print(f"AutoReject: dropped {n_epochs_dropped} epochs, "
+          f"interpolated {n_interpolated} channel-epoch pairs")
+
+    ch_interp_counts = (labels == 1).sum(axis=0)
+    top_channels = np.argsort(ch_interp_counts)[::-1][:10]
+    for idx in top_channels:
+        if ch_interp_counts[idx] > 0:
+            print(f"  {epochs.ch_names[idx]}: interpolated in {ch_interp_counts[idx]} epochs")
+
+    if report is not None:
+        fig_log = reject_log.plot('horizontal', show=False)
+        _add_fig(report, fig_log, 'AutoReject Log (horizontal)', sec)
+
+    return epochs_out
+
+
+def run_artifact_rejection(epochs, method, peak_to_peak_thresh, report=None):
+    """Dispatch to the chosen rejection method.  Returns clean Epochs.
+
+    method:
+        'autoreject'   — data-driven (recommended default)
+        'peak_to_peak' — fixed amplitude threshold
+        'both'         — peak-to-peak coarse pass, then AutoReject on survivors
+    """
+    sec = '6 · Artifact Rejection'
+
+    if method == 'peak_to_peak':
+        epochs_clean = _reject_peak_to_peak(epochs, peak_to_peak_thresh, report, sec)
+        label = 'After Peak-to-Peak Rejection'
+
+    elif method == 'autoreject':
+        epochs_clean = _reject_autoreject(epochs, report, sec)
+        label = 'After AutoReject'
+
+    elif method == 'both':
+        epochs_pp    = _reject_peak_to_peak(epochs, peak_to_peak_thresh, report, sec)
+        epochs_clean = _reject_autoreject(epochs_pp, report, sec)
+        label = 'After Peak-to-Peak + AutoReject'
+
+    else:
+        raise ValueError(f"Unknown ARTIFACT_REJECTION_METHOD: {method!r}. "
+                         "Choose 'autoreject', 'peak_to_peak', or 'both'.")
+
+    if report is not None:
+        # Per-condition epoch counts
+        n_total   = len(epochs)
+        n_kept    = len(epochs_clean)
+        fig_cnt, ax_cnt = plt.subplots(figsize=(8, 4))
+        conditions = ['bin/0', 'bin/1', 'bin/2', 'bin/3', 'bin/4',
+                      'noise/prelude', 'noise/postlude']
+        counts_before = [epochs[c].events.shape[0] if c in epochs.event_id else 0
+                         for c in conditions]
+        counts_after  = [epochs_clean[c].events.shape[0] if c in epochs_clean.event_id else 0
+                         for c in conditions]
+        x = np.arange(len(conditions))
+        ax_cnt.bar(x - 0.2, counts_before, 0.4, label='Before rejection', color='steelblue', alpha=0.7)
+        ax_cnt.bar(x + 0.2, counts_after,  0.4, label='After rejection',  color='darkorange', alpha=0.7)
+        for xi, (cb, ca) in enumerate(zip(counts_before, counts_after)):
+            pct = 100 * ca / cb if cb > 0 else 0
+            ax_cnt.text(xi, max(cb, ca) + 0.5, f'{ca}/{cb}\n({pct:.0f}%)',
+                        ha='center', va='bottom', fontsize=8)
+        ax_cnt.set_xticks(x)
+        ax_cnt.set_xticklabels([c.replace('noise/', '') for c in conditions])
+        ax_cnt.set_ylabel('Epoch count')
+        ax_cnt.set_title(f'Epochs retained per condition — {label}\n'
+                         f'Total: {n_kept}/{n_total} kept ({100*n_kept/n_total:.0f}%)')
+        ax_cnt.legend()
+        plt.tight_layout()
+        _add_fig(report, fig_cnt, f'Epoch Counts per Condition — {label}', sec)
+
+        # Butterfly + topomaps at peak time points (core bins only)
+        figs_cavg = epochs_clean['bin'].average().plot_joint(show=False)
+        figs_cavg = figs_cavg if isinstance(figs_cavg, list) else [figs_cavg]
+        for fig in figs_cavg:
+            _add_fig(report, fig, f'Epoch Average — {label}', sec)
+
+        fig_psd = epochs_clean.compute_psd(fmin=0, fmax=50, method='welch',
+                                           n_fft=len(epochs_clean.times)).plot(show=False)
+        _add_fig(report, fig_psd, f'Epochs PSD (0–50 Hz) — {label}', sec)
+
+    return epochs_clean
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 7 · Occipital SSVEP PSD
+# ══════════════════════════════════════════════════════════════════════════════
+
+def report_ssvep_psd(epochs_clean, occipital_regexp, report=None):
+    """Plot occipital PSD and FFT histograms and add to report."""
+    sec = '7 · Occipital SSVEP PSD'
+    occipital_picks = mne.pick_channels_regexp(epochs_clean.ch_names, occipital_regexp)
+
+    # Welch PSD (all occipital channels)
+    psd = epochs_clean.compute_psd(fmin=0, fmax=50, picks=occipital_picks,
+                                   method='welch', n_fft=len(epochs_clean.times))
+    fig_opsd = psd.plot(show=False)
+    _add_fig(report, fig_opsd,
+             'Occipital PSD — Clean Epochs (0–50 Hz)\n'
+             'Expected SSVEP harmonics: 10, 12, 15, 20, 24, 30 Hz',
+             sec)
+
+    # FFT histogram — occipital channels averaged
+    fig_fft_occ, _ = plot_fft_histogram(
+        epochs_clean, picks=occipital_picks,
+        title='FFT — Occipital channels average')
+    _add_fig(report, fig_fft_occ, 'FFT Histogram — Occipital Channels', sec)
+
+    # FFT histogram — single representative sensor E90
+    if 'E90' in epochs_clean.ch_names:
+        fig_fft_e90, _ = plot_fft_histogram(
+            epochs_clean, picks=['E90'],
+            title='FFT — single occipital sensor')
+        _add_fig(report, fig_fft_e90, 'FFT Histogram — E90', sec)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN PIPELINE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    raw_clean_path = os.path.expanduser(
+        f"{data_path}/{subject_id}/eeg/{subject_id}_preproc-raw.fif"
+    )
+    epochs_fif_path = os.path.expanduser(
+        f"{data_path}/{subject_id}/eeg/{subject_id}_preproc-epoch.fif"
+    )
+
+    # ── Create report ─────────────────────────────────────────────────────────
+    report = mne.Report(title=f"EEG Preprocessing — {subject_id}", verbose=True) \
+             if SAVE_REPORT else None
+
+    # ── Fast path A: load cached clean epochs (skip everything) ───────────────
+    if LOAD_EPOCHS_IF_EXISTS and os.path.exists(epochs_fif_path):
+        print(f"Loading cached clean epochs from {epochs_fif_path}")
+        epochs_clean = mne.read_epochs(epochs_fif_path, preload=True)
+        raw = None   # not needed downstream
+
+    else:
+        # ── Fast path B: load cached clean raw (skip filtering/ICA/reref) ──────
+        if LOAD_RAW_CLEAN_IF_EXISTS and os.path.exists(raw_clean_path):
+            print(f"Loading cached clean raw from {raw_clean_path}")
+            raw_clean = mne.io.read_raw_fif(raw_clean_path, preload=True)
+            # Also need original raw for event detection in run_epoching
+            raw = mne.io.read_raw_egi(
+                f"{data_path}/{subject_id}/eeg/KHNCL-NetStation/"
+                f"{subject_id}_V1Loc_2026{recording_str}.mff",
+                preload=True   # need data for report figures
+            )
+            raw.set_channel_types({'VREF': 'misc'})
+
+            # Still generate sections 1–4b for the report from the loaded data
+            report_raw(raw, report)
+            if DO_FILTERING:
+                run_filtering(raw, l_freq=FILTER_HIGH, h_freq=FILTER_LOW, report=report)
+            if DO_BAD_CHANNELS:
+                run_bad_channels(raw.copy(), BAD_CHANNELS, INTERPOLATE_BADS, report)
+            if DO_ICA:
+                run_ica(raw_clean, ICA_EXCLUDE_COMPS, ICA_EOG_PROXY_CH,
+                        n_components=ICA_N_COMPONENTS, report=report)
+            if DO_REREFERENCING:
+                run_rereferencing(raw_clean.copy(), report)
+
+        else:
+            # ── Full pipeline from raw ─────────────────────────────────────────
+            raw = mne.io.read_raw_egi(
+                f"{data_path}/{subject_id}/eeg/KHNCL-NetStation/"
+                f"{subject_id}_V1Loc_2026{recording_str}.mff",
+                preload=True
+            )
+            raw.set_channel_types({'VREF': 'misc'})
+
+            # ── Section 1 · Raw Data ───────────────────────────────────────────
+            report_raw(raw, report)
+
+            # ── Section 2 · Filtering ──────────────────────────────────────────
+            raw_fil = run_filtering(raw, l_freq=FILTER_HIGH, h_freq=FILTER_LOW, report=report) if DO_FILTERING else raw.copy()
+
+            # ── Section 3 · Bad Channels ───────────────────────────────────────
+            if DO_BAD_CHANNELS:
+                run_bad_channels(raw_fil, BAD_CHANNELS, INTERPOLATE_BADS, report)
+
+            # ── Section 4 · ICA ────────────────────────────────────────────────
+            if DO_ICA:
+                raw_clean = run_ica(raw_fil, ICA_EXCLUDE_COMPS, ICA_EOG_PROXY_CH,
+                                    n_components=ICA_N_COMPONENTS, report=report)
+            else:
+                raw_clean = raw_fil.copy()
+
+            # ── Section 4b · Re-referencing ────────────────────────────────────
+            if DO_REREFERENCING:
+                run_rereferencing(raw_clean, report)
+
+            # ── Save clean raw ─────────────────────────────────────────────────
+            if SAVE_RAW_CLEAN:
+                raw_clean.save(raw_clean_path, overwrite=True)
+                print(f"Clean raw saved → {raw_clean_path}")
+
+        # ── Section 5 · Epoching ───────────────────────────────────────────────
+        if DO_EPOCHING:
+            epochs = run_epoching(raw, raw_clean, EPOCH_TMIN, EPOCH_TMAX,
+                                  core_only=EPOCH_CORE_ONLY, report=report)
+        else:
+            epochs = None
+
+        # ── Section 6 · Artifact Rejection ─────────────────────────────────────
+        if DO_ARTIFACT_REJECTION and epochs is not None:
+            epochs_clean = run_artifact_rejection(epochs, ARTIFACT_REJECTION_METHOD,
+                                                  PEAK_TO_PEAK_THRESH, report)
+        else:
+            epochs_clean = epochs
+
+        # ── Save clean epochs ──────────────────────────────────────────────────
+        if SAVE_EPOCHS and epochs_clean is not None:
+            epochs_clean.save(epochs_fif_path, overwrite=True)
+            print(f"Clean epochs saved → {epochs_fif_path}")
+
+    # ── Section 7 · Occipital SSVEP PSD ──────────────────────────────────────
+    if DO_SSVEP_PSD and epochs_clean is not None:
+        report_ssvep_psd(epochs_clean, OCCIPITAL_REGEXP, report)
+
+    # ── Save report ───────────────────────────────────────────────────────────
+    if SAVE_REPORT and report is not None:
+        report_path = os.path.expanduser(
+            f"{data_path}/{subject_id}/eeg/{subject_id}_preproc_report.html"
+        )
+        report.save(report_path, overwrite=True, open_browser=False)
+        print(f"\nReport saved → {report_path}")
+
+
+if __name__ == '__main__':
+    main()
