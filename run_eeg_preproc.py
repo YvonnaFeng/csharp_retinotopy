@@ -23,6 +23,7 @@ DO_REREFERENCING      = True
 DO_EPOCHING           = True
 DO_ARTIFACT_REJECTION = True
 DO_SSVEP_PSD          = True
+DO_SSVEP_SNR          = True
 
 # ── Output toggles ────────────────────────────────────────────────────────────
 SAVE_REPORT  = True   # write the HTML report to disk
@@ -60,18 +61,25 @@ PEAK_TO_PEAK_THRESH = 120e-6   # volts; only used when method is 'peak_to_peak' 
 # ── Raw clean I/O ─────────────────────────────────────────────────────────────
 # Saves cleaned continuous data after re-referencing (before epoching).
 # Useful checkpoint: re-run epoching/rejection without redoing filtering/ICA.
-SAVE_RAW_CLEAN           = True
-LOAD_RAW_CLEAN_IF_EXISTS = False   # set False to force re-run from raw
+SAVE_RAW_CLEAN           = False
+LOAD_RAW_CLEAN_IF_EXISTS = True   # set False to force re-run from raw
 
 # ── Epochs I/O ───────────────────────────────────────────────────────────────
 # SAVE_EPOCHS      — write clean epochs to disk after artifact rejection
 # LOAD_EPOCHS_IF_EXISTS — if the file already exists, skip raw→epochs pipeline
 #                         and load directly (avoids re-running AutoReject, etc.)
-SAVE_EPOCHS           = True
-LOAD_EPOCHS_IF_EXISTS = False   # set False to force a full re-run
+SAVE_EPOCHS           = False
+LOAD_EPOCHS_IF_EXISTS = True   # set False to force a full re-run
 
 # ── Occipital channels for SSVEP ──────────────────────────────────────────────
 OCCIPITAL_REGEXP = r'E8[1-4]|E8[8-9]|E90|E91|E94|E95' # right hemi occipital channels
+
+# ── SSVEP SNR ─────────────────────────────────────────────────────────────────
+SSVEP_STIM_FREQS  = (5.0, 6.0, 7.5)   # fundamental stimulation frequencies (Hz)
+SSVEP_FMAX        = 75.0               # highest harmonic to include (Hz)
+SSVEP_N_NEIGHBORS = 3                  # noise bins collected on each side per harmonic
+SSVEP_SNR_TYPE    = 'amplitude_ratio'            # 'ratio' (power), 'amplitude_ratio', or 'zscore'
+SSVEP_N_EPOCHS    = None               # int → subsample to this many core epochs; None → use all
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -86,10 +94,6 @@ def _add_fig(report, fig, title, section):
         plt.show()
     plt.close(fig)
 
-
-def _close_figs(figs):
-    for f in (figs if isinstance(figs, list) else [figs]):
-        plt.close(f)
 
 def plot_fft_histogram(epochs, picks=None, fmax=80,
                        target_freqs=[10, 12, 15, 20, 24, 30, 36, 40, 45, 48, 60],
@@ -131,6 +135,239 @@ def plot_fft_histogram(epochs, picks=None, fmax=80,
            title=title, xlim=[-freq_res / 2, fmax + freq_res])
     plt.tight_layout()
     return fig, ax
+
+
+def compute_ssvep_snr(epochs_or_evoked, stim_freqs=(5., 6., 7.5), fmax=75.,
+                      n_neighbors=1, snr_type='ratio', picks='eeg'):
+    """Compute per-channel SSVEP SNR from even harmonics vs. neighboring bins.
+
+    Averages epochs in the time domain before FFT.
+    Power at each harmonic compared to the local noise floor estimated from adjacent bins (skipping any bin that
+    coincides with a harmonic of any stimulus frequency, and skipping 60 Hz).
+
+    Parameters
+    ----------
+    epochs_or_evoked : mne.Epochs | mne.Evoked
+    stim_freqs : tuple[float]
+        Fundamental stimulus frequencies (Hz).  Even harmonics 2f, 4f, … are used.
+    fmax : float
+        Highest harmonic frequency to include (Hz).
+    n_neighbors : int
+        Number of noise bins on each side of each harmonic bin (default 1).
+    snr_type : 'ratio' | 'amplitude_ratio' | 'zscore'
+        'ratio' (default): Σ P(f_h) / Σ μ_P(f_h).  Power ratio; signal is N× the
+            noise floor in power.  Dimensionless → directly comparable across EEG
+            and MEG sessions with the same task.
+        'amplitude_ratio': Σ |X(f_h)| / Σ μ_A(f_h).  Same logic on amplitude
+            (square root of power).  Norcia-lab convention; slightly more intuitive
+            ("signal amplitude is N× noise amplitude").  Also cross-modality
+            comparable.  Numerically ≈ √(power_ratio) but not identical because
+            of how the summation interacts with the square root.
+        'zscore': Σ_h (P(f_h) − μ_noise_h) / μ_noise_h  =  Σ(ratio_h − 1).
+            Normalized excess; harder to interpret because the sum grows with the
+            number of harmonics (5 Hz gets 6 terms, 7.5 Hz gets 3).
+    picks : str | list
+        Channel selection.
+
+    Returns
+    -------
+    snr : dict[float → ndarray(n_channels,)]
+        SNR per channel for each stimulus frequency.
+    info : mne.Info
+        Channel info matching the returned arrays.
+    harmonics_used : dict[float → list[float]]
+        Actual harmonic frequencies analyzed per stim freq (for diagnostics).
+    """
+    # ── Time-domain average → single evoked signal ────────────────────────────
+    # Averaging first (before FFT)
+    if isinstance(epochs_or_evoked, mne.BaseEpochs):
+        evoked = epochs_or_evoked.average(picks=picks)
+    else:
+        evoked = epochs_or_evoked.copy().pick(picks)
+
+    data = evoked.data           # (n_channels, n_times)  real-valued
+    sfreq = evoked.info['sfreq']
+    n_times = data.shape[-1]
+    n_ch = data.shape[0]
+
+    # FFT on the time-averaged signal; power = |X[k]|²
+    # np.fft.rfft returns the one-sided spectrum.
+    # All bins share the same normalization so ratios and z-scores are exact.
+    X = np.fft.rfft(data, axis=-1)      # (n_ch, n_freqs)  complex128
+    A = np.abs(X)                        # (n_ch, n_freqs)  amplitude
+    P = A ** 2                           # (n_ch, n_freqs)  power; same scale for all bins
+    freqs = np.fft.rfftfreq(n_times, d=1.0 / sfreq)
+    freq_res = freqs[1] - freqs[0]
+
+    # Enumerate valid even harmonics
+    all_harmonic_bins = set()   # bins to never use as noise neighbors
+    stim_harmonics = {}         # sf → [(bin_idx, freq), ...]  harmonics to analyze
+
+    for sf in stim_freqs:
+        hlist = []
+        mult = 2
+        while True:
+            f_h = sf * mult
+            if f_h > fmax + freq_res * 0.5:
+                break
+            k_h = int(round(f_h / freq_res))
+            if k_h >= len(freqs):
+                mult += 2
+                continue
+            actual_f = freqs[k_h]
+            all_harmonic_bins.add(k_h)
+            # Skip 60 Hz (notch-filtered; still exclude from noise bins)
+            if abs(actual_f - 60.0) < freq_res * 0.5:
+                mult += 2
+                continue
+            if actual_f > fmax:
+                mult += 2
+                continue
+            # Warn if epoch length is mismatched and harmonic lands off-bin
+            if abs(f_h - actual_f) > freq_res * 0.01:
+                print(f"  Warning: {sf} Hz × {mult} = {f_h:.3f} Hz → nearest bin "
+                      f"{actual_f:.3f} Hz (offset {abs(f_h-actual_f):.4f} Hz; "
+                      f"freq_res={freq_res:.4f} Hz).  Check epoch length.")
+            hlist.append((k_h, actual_f))
+            mult += 2
+        stim_harmonics[sf] = hlist
+
+    harmonics_used = {sf: [f for _, f in v] for sf, v in stim_harmonics.items()}
+
+    # ── Helper: find n valid neighbor bins on each side, skipping harmonics ───
+    def _neighbor_bins(k_h, n, excluded, max_k):
+        left, right = [], []
+        k = k_h - 1
+        while len(left) < n and k >= 0:
+            if k not in excluded:
+                left.append(k)
+            k -= 1
+        k = k_h + 1
+        while len(right) < n and k < max_k:
+            if k not in excluded:
+                right.append(k)
+            k += 1
+        return left + right
+
+    # ── SNR per stimulus frequency ────────────────────────────────────────────
+    snr = {}
+    for sf, hlist in stim_harmonics.items():
+        if not hlist:
+            snr[sf] = np.zeros(n_ch)
+            continue
+
+        if snr_type in ('ratio', 'amplitude_ratio'):
+            # Σ signal / Σ mean_noise — power for 'ratio', amplitude for 'amplitude_ratio'
+            vals = P if snr_type == 'ratio' else A
+            sig_sum = np.zeros(n_ch)
+            noi_sum = np.zeros(n_ch)
+            for k_h, _ in hlist:
+                nbr = _neighbor_bins(k_h, n_neighbors, all_harmonic_bins, len(freqs))
+                if not nbr:
+                    continue
+                sig_sum += vals[:, k_h]
+                noi_sum += vals[:, nbr].mean(axis=1)
+            snr[sf] = np.where(noi_sum > 0, sig_sum / noi_sum, 0.0)
+
+        else:  # 'zscore' — Σ (ratio_h − 1) across harmonics
+            # Denominator is the local noise mean, not σ.  Using σ collapses when
+            # n_neighbors is small: a smooth noise floor gives σ ≈ 0 for just 2 bins,
+            # inflating z into the thousands.  Dividing by μ gives (P/μ − 1), i.e.
+            # "how many noise-floor units above noise" — stable, bounded below by -1.
+            z_accum = np.zeros(n_ch)
+            for k_h, _ in hlist:
+                nbr = _neighbor_bins(k_h, n_neighbors, all_harmonic_bins, len(freqs))
+                if not nbr:
+                    continue
+                mu = P[:, nbr].mean(axis=1)
+                mu = np.where(mu > 0, mu, np.finfo(float).eps)
+                z_accum += (P[:, k_h] - mu) / mu          # = ratio_h − 1
+            snr[sf] = z_accum
+
+    return snr, evoked.info, harmonics_used
+
+
+def plot_ssvep_snr_topo(snr_dict, info, harmonics_used=None, snr_type='zscore'):
+    """Sensor topography of SSVEP SNR, one subplot per stimulus frequency."""
+    stim_freqs = sorted(snr_dict.keys())
+    n = len(stim_freqs)
+    fig, axes = plt.subplots(1, n, figsize=(5 * n, 4.5))
+    if n == 1:
+        axes = [axes]
+
+    cbar_label = {'ratio': 'SNR (power ratio)',
+                  'amplitude_ratio': 'SNR (amplitude ratio)',
+                  'zscore': 'SNR (Σ ratio−1)'}.get(snr_type, 'SNR')
+
+    for ax, sf in zip(axes, stim_freqs):
+        data = snr_dict[sf]
+        vmin, vmax = np.percentile(data, [5, 95])
+        # Symmetric color range around zero for z-score; asymmetric for ratio
+        if snr_type == 'zscore':
+            bound = max(abs(vmin), abs(vmax))
+            vmin, vmax = -bound, bound
+        im, _ = mne.viz.plot_topomap(data, info, axes=ax, show=False,
+                                     cmap='RdBu_r', vlim=(vmin, vmax))
+        h_str = ', '.join(f'{h:.1f}' for h in (harmonics_used or {}).get(sf, []))
+        ax.set_title(f'{sf} Hz\n[{h_str} Hz]', fontsize=9)
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label=cbar_label)
+
+    fig.suptitle(f'SSVEP SNR Topography ({snr_type})', y=1.02)
+    plt.tight_layout()
+    return fig
+
+
+def report_ssvep_snr(epochs_clean, stim_freqs=None, fmax=None, n_neighbors=None,
+                     snr_type=None, n_epochs=None, picks='eeg', report=None):
+    """Compute SSVEP SNR on core epochs and add topography to the report.
+
+    Only 'bin/*' epochs are used (prelude/postlude noise epochs are excluded).
+    Optionally subsamples to n_epochs core epochs (random, without replacement)
+    to assess how SNR scales with trial count.
+    """
+    sec = '8 · SSVEP SNR'
+    stim_freqs  = stim_freqs  if stim_freqs  is not None else SSVEP_STIM_FREQS
+    fmax        = fmax        if fmax        is not None else SSVEP_FMAX
+    n_neighbors = n_neighbors if n_neighbors is not None else SSVEP_N_NEIGHBORS
+    snr_type    = snr_type    if snr_type    is not None else SSVEP_SNR_TYPE
+    n_epochs    = n_epochs    if n_epochs    is not None else SSVEP_N_EPOCHS
+
+    # ── Restrict to core stimulus epochs only ─────────────────────────────────
+    core = epochs_clean['bin']
+    n_available = len(core)
+
+    # ── Optional random subsample ─────────────────────────────────────────────
+    if n_epochs is not None:
+        if n_epochs > n_available:
+            print(f"  Warning: requested {n_epochs} epochs but only {n_available} "
+                  f"core epochs available; using all.")
+            n_epochs = n_available
+        rng = np.random.default_rng(seed=0)
+        idx = rng.choice(n_available, size=n_epochs, replace=False)
+        idx.sort()
+        core = core[idx]
+        epoch_label = f'{n_epochs}/{n_available} core epochs (random subsample)'
+    else:
+        epoch_label = f'{n_available} core epochs'
+
+    print(f"  SSVEP SNR: using {epoch_label}")
+
+    snr_dict, info, harmonics_used = compute_ssvep_snr(
+        core, stim_freqs=stim_freqs, fmax=fmax,
+        n_neighbors=n_neighbors, snr_type=snr_type, picks=picks,
+    )
+
+    for sf in sorted(stim_freqs):
+        arr = snr_dict[sf]
+        print(f"  SSVEP SNR [{snr_type}] {sf} Hz: "
+              f"mean={arr.mean():.2f}  max={arr.max():.2f}  "
+              f"harmonics={harmonics_used[sf]}")
+
+    title = f'SSVEP SNR Topography ({snr_type}) — {epoch_label}'
+    fig = plot_ssvep_snr_topo(snr_dict, info, harmonics_used, snr_type=snr_type)
+    _add_fig(report, fig, title, sec)
+
+    return snr_dict, info
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -633,6 +870,10 @@ def main():
     # ── Section 7 · Occipital SSVEP PSD ──────────────────────────────────────
     if DO_SSVEP_PSD and epochs_clean is not None:
         report_ssvep_psd(epochs_clean, OCCIPITAL_REGEXP, report)
+
+    # ── Section 8 · SSVEP SNR ─────────────────────────────────────────────────
+    if DO_SSVEP_SNR and epochs_clean is not None:
+        report_ssvep_snr(epochs_clean, report=report)
 
     # ── Save report ───────────────────────────────────────────────────────────
     if SAVE_REPORT and report is not None:

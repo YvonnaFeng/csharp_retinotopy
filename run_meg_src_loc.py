@@ -41,6 +41,14 @@ warnings.filterwarnings("ignore", message="numpy.dtype size changed")
 warnings.filterwarnings("ignore", message="numpy.ufunc size changed")
 import meg_load_preprocess as meg
 from make_forward_inverse import make_forward, make_inverse, get_filtered_stc
+from run_eeg_preproc import compute_ssvep_snr, plot_ssvep_snr_topo
+
+# ── MEG SSVEP SNR ──────────────────────────────────────────────────────────────
+MEG_SSVEP_STIM_FREQS  = (5.0, 6.0, 7.5)   # fundamental stimulation frequencies (Hz)
+MEG_SSVEP_FMAX        = 75.0               # highest harmonic to include (Hz)
+MEG_SSVEP_N_NEIGHBORS = 3                  # noise bins per side per harmonic
+MEG_SSVEP_SNR_TYPE    = 'amplitude_ratio'            # 'ratio' (power), 'amplitude_ratio', or 'zscore'
+MEG_SSVEP_N_EPOCHS    = None               # int → subsample core epochs; None → use all
 
 
 def plot_fft_histogram_meg(epochs, picks='mag', fmax=80,
@@ -208,15 +216,46 @@ if __name__ == '__main__':
             report.add_figure(fig_fft_all, title='FFT — all channels',
                               section='Epochs QC')
             plt.close(fig_fft_all)
+
+        # ── SSVEP SNR topography (core epochs only, optional subsample) ───────
+        n_core_total = len(epochs['bin'])
+        core_epochs  = epochs['bin']
+        if MEG_SSVEP_N_EPOCHS is not None:
+            n_use = min(MEG_SSVEP_N_EPOCHS, n_core_total)
+            rng   = np.random.default_rng(seed=0)
+            idx   = np.sort(rng.choice(n_core_total, size=n_use, replace=False))
+            core_epochs  = core_epochs[idx]
+            epoch_label  = f'{n_use}/{n_core_total} core epochs (random subsample)'
+        else:
+            epoch_label  = f'{n_core_total} core epochs'
+
+        print(f"  MEG SSVEP SNR: using {epoch_label}")
+        snr_dict, snr_info, harmonics_used = compute_ssvep_snr(
+            core_epochs, stim_freqs=MEG_SSVEP_STIM_FREQS, fmax=MEG_SSVEP_FMAX,
+            n_neighbors=MEG_SSVEP_N_NEIGHBORS, snr_type=MEG_SSVEP_SNR_TYPE, picks=picks,
+        )
+        for sf in sorted(MEG_SSVEP_STIM_FREQS):
+            arr = snr_dict[sf]
+            print(f"  MEG SSVEP SNR [{MEG_SSVEP_SNR_TYPE}] {sf} Hz: "
+                  f"mean={arr.mean():.2f}  max={arr.max():.2f}  "
+                  f"harmonics={harmonics_used[sf]}")
+        if save_report:
+            fig_snr = plot_ssvep_snr_topo(snr_dict, snr_info, harmonics_used,
+                                          snr_type=MEG_SSVEP_SNR_TYPE)
+            report.add_figure(fig_snr,
+                              title=f'SSVEP SNR Topography ({MEG_SSVEP_SNR_TYPE}) — {epoch_label}',
+                              section='SSVEP SNR')
+            plt.close(fig_snr)
+
         if viz_bool:
             ts_args = dict(time_unit="s")
             topomap_args = dict(time_unit="s")
             fig = evokeds['bin'].plot_joint(times="peaks", ts_args=ts_args, topomap_args=topomap_args, title=file + ' Task: ' + task + ', Condition: bin')
         
         # --- 4. Create covariance --------------------------------------------
-        cov = mne.compute_covariance(epochs['noise'], tmax=None, projs=None, method="empirical", rank=None)
-        cov = mne.cov.regularize(cov, epochs['noise'].info, mag=0.05, grad = 0.05, proj = True, exclude = 'bads')
-        cov.save(f'{sample_dir}/V1Loc_empirical_cov.fif', overwrite=True)
+        # cov = mne.compute_covariance(epochs['noise'], tmax=None, projs=None, method="empirical", rank=None)
+        # cov = mne.cov.regularize(cov, epochs['noise'].info, mag=0.05, grad = 0.05, proj = True, exclude = 'bads')
+        # cov.save(f'{sample_dir}/V1Loc_empirical_cov.fif', overwrite=True)
 
         # --- 5. Forward solution ---------------------------------------------
         fwd = make_forward(subject, subjects_dir, trans, evokeds['bin'],
@@ -228,7 +267,7 @@ if __name__ == '__main__':
         
         # --- 6. Inverse solution ---------------------------------------------
         # fwd = mne.read_forward_solution(f'{subjects_dir}/{subject}/bem/{subject}-fwd.fif')
-        # cov = mne.read_cov(f'{sample_dir}/V1Loc_empirical_cov.fif')
+        cov = mne.read_cov(f'{sample_dir}/V1Loc_empirical_cov.fif')
         # # Restrict forward to channels present in the evoked (handles bad-channel drops)
         # fwd = mne.pick_channels_forward(fwd, evokeds['bin'].ch_names, ordered=False)
         inverse_method ='dSPM'
@@ -242,7 +281,7 @@ if __name__ == '__main__':
                      fixed_ori=True,
                      snr=3, lambda2=None,
                      inverse_method=inverse_method,
-                     save_dir=None, eeg=False, meg=True)
+                     save_dir=save_dir, eeg=False, meg=True)
         
         # --- 8. Visualize inverse --------------------------------------------
         if viz_bool:
