@@ -380,7 +380,7 @@ def get_filtered_stc(fwd, epochs, cov,
                      fixed_ori=True,
                      snr=8.0, lambda2=None,
                      inverse_method="MNE",
-                     save_dir=None):
+                     save_dir=None, eeg=True, meg=False):
     """Frequency-domain filtering pipeline for SSVEP source localization.
 
     For each target stimulus frequency, this function:
@@ -410,12 +410,18 @@ def get_filtered_stc(fwd, epochs, cov,
     inverse_method : str
     save_dir : str or Path, optional
     """
-    eeg_picks = mne.pick_types(epochs.info, eeg=True, exclude='bads')
-    eeg_info  = mne.pick_info(epochs.info, eeg_picks)
+    if eeg:
+        ch_picks = 'eeg'
+        idx = mne.pick_types(epochs.info, eeg=True, exclude='bads')
+        meeg_info = mne.pick_info(epochs.info, idx)
+    elif meg:
+        ch_picks = 'meg'
+        idx = mne.pick_types(epochs.info, meg=True, exclude='bads')
+        meeg_info = mne.pick_info(epochs.info, idx)
 
     # average_epochs=False: we need per-epoch complex spectra so we can filter
     # each epoch and iFFT back before averaging the time series.
-    freqs, spectra = _time_to_freq(epochs, full=True, detrend=False,
+    freqs, spectra = _time_to_freq(epochs, picks=ch_picks, full=True, detrend=False,
                                    unit="raw", average_epochs=False)
     # spectra shape: (n_epochs, n_freqs, n_channels)
 
@@ -443,15 +449,15 @@ def get_filtered_stc(fwd, epochs, cov,
         # Build evoked from filtered mean time series
         evoked = mne.EvokedArray(
             ts_mean.T,                               # (n_channels, n_times)
-            eeg_info,
+            meeg_info,
             tmin=float(epochs.times[0]),
             nave=len(epochs),
             comment=f"SSVEP filtered {base_freq} Hz ({harmonics} harmonics)",
         )
 
         if save_dir is not None:
-            fig = evoked.plot_joint(picks="eeg", show=False)
-            fig.savefig(f"{save_dir}/eeg_evoked_{label}.png",
+            fig = evoked.plot_joint(picks=ch_picks, show=False)
+            fig.savefig(f"{save_dir}/evoked_{label}.png",
                         dpi=300, bbox_inches="tight", pad_inches=0)
 
         # ── Inverse solution ──────────────────────────────────────────────────
@@ -482,6 +488,7 @@ def _time_to_freq(
     unit: Literal["raw", "real"] = "raw", # "raw": unnormalized FFT coefficients; "real": normalized, np.abs(fft_c)=real-valued amplitude, (accounts for one-sided folding and 1/N scaling).
     average_epochs: bool = True,        # mne.Epochs only: if True average amplitude spectra across epochs;
                                         # if False return per-epoch spectra (n_epochs, n_freqs, n_channels).
+    picks: str = 'eeg',                 # channel type to extract from mne.Epochs ('eeg' or 'meg')
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Compute the FFT of time-domain EEG data.
     Accepts either a raw numpy array or an mne.Epochs
@@ -502,7 +509,7 @@ def _time_to_freq(
         sfreq = wave.info['sfreq']
         # get_data returns (n_epochs, n_channels, n_times); transpose each epoch
         # to (n_times, n_channels) to match the array convention below.
-        data = wave.get_data(picks='eeg')          # (n_epochs, n_ch, n_times)
+        data = wave.get_data(picks=picks)          # (n_epochs, n_ch, n_times)
         epoch_spectra = []
         for epoch in data:                          # epoch: (n_ch, n_times)
             X = epoch.T                             # → (n_times, n_ch)

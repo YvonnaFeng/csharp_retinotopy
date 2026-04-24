@@ -37,7 +37,7 @@ cov = mne.read_cov(f'{sample_dir}/empirical_reg_cov.fif')
 
 # forward solution
 fwd = make_forward(subject, subjects_dir, trans, evoked,
-                 overwrite_fwd=False, overwrite=False,
+                 overwrite_fwd=True, overwrite=False,
                  fixed=True, bem_ico=4, src_space="oct7",
                  conductivity=(0.3, 0.006, 0.3),
                  mindist=5, surface='mid',
