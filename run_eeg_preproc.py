@@ -11,8 +11,8 @@ import numpy as np
 # CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-subject_id    = "S001"
-recording_str = "0403_125105"
+subject_id    = "S005"
+recording_str = "0403_014413" # "0403_125105" S001, "0403_014413" S005, "0327_110047" S006
 data_path     = "~/csharp_data"
 
 # ── Step toggles ──────────────────────────────────────────────────────────────
@@ -34,7 +34,7 @@ FILTER_HIGH = 0.5   # high-pass cutoff (Hz) → l_freq; removes slow drifts
 FILTER_LOW  = 85    # low-pass  cutoff (Hz) → h_freq; removes high-freq noise
 
 # ── Bad channels (set before running) ─────────────────────────────────────────
-BAD_CHANNELS = ['E17']
+BAD_CHANNELS = ['E48', 'E31', 'E7', 'E55'] # 'E17' for S001 and S006, ['E48', 'E31', 'E7', 'E55'] for S005
 INTERPOLATE_BADS = True
 
 # ── ICA settings ──────────────────────────────────────────────────────────────
@@ -55,21 +55,21 @@ EPOCH_CORE_ONLY = False
 #                 interpolates bad channel-epochs before dropping whole epochs
 # 'peak_to_peak' — simple fixed-threshold drop (fast but arbitrary, no interpolation)
 # 'both'         — peak-to-peak coarse pass first, then AutoReject on survivors
-ARTIFACT_REJECTION_METHOD = 'peak_to_peak'
-PEAK_TO_PEAK_THRESH = 120e-6   # volts; only used when method is 'peak_to_peak' or 'both'
+ARTIFACT_REJECTION_METHOD = 'autoreject'
+PEAK_TO_PEAK_THRESH = 60e-6   # volts; only used when method is 'peak_to_peak' or 'both'
 
 # ── Raw clean I/O ─────────────────────────────────────────────────────────────
 # Saves cleaned continuous data after re-referencing (before epoching).
 # Useful checkpoint: re-run epoching/rejection without redoing filtering/ICA.
-SAVE_RAW_CLEAN           = False
+SAVE_RAW_CLEAN           = True
 LOAD_RAW_CLEAN_IF_EXISTS = True   # set False to force re-run from raw
 
 # ── Epochs I/O ───────────────────────────────────────────────────────────────
 # SAVE_EPOCHS      — write clean epochs to disk after artifact rejection
 # LOAD_EPOCHS_IF_EXISTS — if the file already exists, skip raw→epochs pipeline
 #                         and load directly (avoids re-running AutoReject, etc.)
-SAVE_EPOCHS           = False
-LOAD_EPOCHS_IF_EXISTS = True   # set False to force a full re-run
+SAVE_EPOCHS           = True
+LOAD_EPOCHS_IF_EXISTS = False   # set False to force a full re-run
 
 # ── Occipital channels for SSVEP ──────────────────────────────────────────────
 OCCIPITAL_REGEXP = r'E8[1-4]|E8[8-9]|E90|E91|E94|E95' # right hemi occipital channels
@@ -673,6 +673,7 @@ def run_artifact_rejection(epochs, method, peak_to_peak_thresh, report=None):
     method:
         'autoreject'   — data-driven (recommended default)
         'peak_to_peak' — fixed amplitude threshold
+        'custom'       — multi-rule Brain Vision-style (raw/flat/peak + channel count)
         'both'         — peak-to-peak coarse pass, then AutoReject on survivors
     """
     sec = '6 · Artifact Rejection'
@@ -685,6 +686,10 @@ def run_artifact_rejection(epochs, method, peak_to_peak_thresh, report=None):
         epochs_clean = _reject_autoreject(epochs, report, sec)
         label = 'After AutoReject'
 
+    elif method == 'custom':
+        epochs_clean = _reject_custom(epochs, report=report, sec=sec)
+        label = 'After Custom Rejection'
+
     elif method == 'both':
         epochs_pp    = _reject_peak_to_peak(epochs, peak_to_peak_thresh, report, sec)
         epochs_clean = _reject_autoreject(epochs_pp, report, sec)
@@ -692,7 +697,7 @@ def run_artifact_rejection(epochs, method, peak_to_peak_thresh, report=None):
 
     else:
         raise ValueError(f"Unknown ARTIFACT_REJECTION_METHOD: {method!r}. "
-                         "Choose 'autoreject', 'peak_to_peak', or 'both'.")
+                         "Choose 'autoreject', 'peak_to_peak', 'custom', or 'both'.")
 
     if report is not None:
         # Per-condition epoch counts

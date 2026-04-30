@@ -474,6 +474,7 @@ def get_filtered_stc(fwd, epochs, cov,
         filtered_stcs[label] = {
             "inv_op": inverse_operator,
             "stc":    stc,
+            "evoked": evoked,
         }
         print(f"  [{label}] {base_freq} Hz {harmonics} harmonics: STC computed")
 
