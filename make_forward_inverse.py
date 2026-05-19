@@ -225,8 +225,8 @@ def make_forward(subject_id, subjects_dir, trans, evoked,
 
     if not bem_fname.exists() or overwrite:
         mne.bem.make_watershed_bem(subject=subject, overwrite=True,
-                                   volume='T1', atlas=True, gcaatlas=True,
-                                   show=visualize)
+                                   volume='T1',atlas=True, gcaatlas=True,
+                                   show=visualize)              
         model = mne.make_bem_model(subject=subject, ico=bem_ico,
                                    conductivity=conductivity)
         mne.write_bem_surfaces(str(bem_fname), model, overwrite=True)
@@ -755,7 +755,18 @@ def _pseudo_inverse_custom(subject, fwd, evoked, snr, fixed_ori):
 # --- Main (example usage) ---------------------------------------------------
 
 if __name__ == '__main__':
-    subjects_dir = Path(os.environ["SUBJECTS_DIR"])
-    # Load trans and evoked, then:
-    #   fwd = make_forward(subject_id, trans, evoked, subjects_dir=subjects_dir)
+    subjects_dir = "/Users/yvonnafeng/Downloads/freesurfer/subjects/"
+    subject_id = "S011"
+
+    sample_dir   = '/Users/yvonnafeng/csharp_data/S001/eeg'
+    epoch_files = ['S001_preproc-epoch.fif']
+    trans        = f'{sample_dir}/S001-trans.fif'
+    for file in epoch_files:
+        # read in epochs
+        epochs = epochs = mne.read_epochs(os.path.join(sample_dir,file), preload=True)
+    epochs_core  = epochs['bin']            # 'bin/0'–'bin/4'
+    epochs_noise = epochs['noise']          # prelude + postlude combined
+    evoked = epochs_core.average()
+
+    fwd = make_forward(subject_id, subjects_dir, trans, evoked, overwrite_fwd=True, overwrite=False)
     #   stc, inv_op = make_inverse(subjects_dir, subject_id, fwd, evoked, noise_cov)

@@ -318,14 +318,35 @@ if __name__ == '__main__':
             subjects_dir=subjects_dir,
             inverse_method=inverse_method,
             visual_labels=visual_labels,
-            mode="snapshot",
-            n_snapshots=5,
+            mode="video",
+            n_snapshots=6,
+            hemi="split",       # "split" | "rh" | "lh"
             views=("caudal", "medial"),
-            show_evoked=None,  # MEG sensors aren't labelled as occipital channels; pass occ_channels=[...] to enable
+            show_evoked=False,  # MEG sensors aren't labelled as occipital channels; pass occ_channels=[...] to enable
             occ_channels=None,
             save_dir=save_dir,
             marker="com",
             com_top_num=20,
+            foci_scale=None,    # None = auto
+        )
+
+        viz_filtered_stcs(
+            filtered_stcs,
+            freq_map,
+            harmonics_map,
+            subjects_dir=subjects_dir,
+            inverse_method=inverse_method,
+            visual_labels=visual_labels,
+            mode="snapshot",
+            n_snapshots=6,
+            hemi="rh",       # "split" | "rh" | "lh"
+            views=("caudal", "medial"),
+            show_evoked=False,  # MEG sensors aren't labelled as occipital channels; pass occ_channels=[...] to enable
+            occ_channels=None,
+            save_dir=save_dir,
+            marker="com",
+            com_top_num=20,
+            foci_scale=None,    # None = auto
         )
         
         # --- 8. Visualize inverse --------------------------------------------
@@ -339,7 +360,7 @@ if __name__ == '__main__':
                 initial_time=time_max,
                 time_unit="s",
                 size=(800, 800),
-                smoothing_steps=5)
+                smoothing_steps=3)
 
             brain = stc_plot.plot(**surfer_kwargs)
             brain.plotter.scalar_bar.GetLabelTextProperty().SetFontSize(8)

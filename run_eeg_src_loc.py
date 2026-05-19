@@ -93,13 +93,15 @@ viz_filtered_stcs(
     subjects_dir=subjects_dir,
     inverse_method=inverse_method,
     visual_labels=visual_labels,
-    mode="snapshot",          # "snapshot" | "video"
-    n_snapshots=5,
+    mode="video",          # "snapshot" | "video"
+    n_snapshots=6,
+    hemi="split",             # "split" | "rh" | "lh" — rh uses compact single-column layout
     views=("caudal", "medial"),
     show_evoked=None,         # None = auto (True for snapshot, False for video)
     occ_channels=None,        # None = auto-detect occipital channels
     save_dir=save_dir,        # None = interactive window
     marker="com",             # "peak" | "com" | None
     com_top_num=20,           # top-N rh vertices used for COM centroid
+    foci_scale=None,          # None = auto (1.2 for rh/lh, 0.6 for split)
 )
 

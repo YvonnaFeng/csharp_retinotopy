@@ -12,13 +12,23 @@ _DEFAULT_OCC_CH = (
     "E81", "E82", "E83", "E84", "E88", "E89", "E90", "E91", "E94", "E95",  # EGI HydroCel
 )
 
+# hemi and size are intentionally absent — both are auto-derived from the hemi parameter
 _BRAIN_DEFAULTS = dict(
-    hemi="split",
-    size=(800, 800),
-    smoothing_steps=5,
+    smoothing_steps=3,
     background="white",
     foreground="black",
 )
+
+
+def _auto_brain_size(hemi):
+    """Single-column layout (one hemisphere, two views stacked) vs two-column split."""
+    return (500, 800) if hemi in ("rh", "lh") else (800, 800)
+
+def _auto_foci_scale(hemi):
+    return 1.2 if hemi in ("rh", "lh") else 0.6
+
+def _auto_cbar_height(hemi):
+    return 0.08 if hemi in ("rh", "lh") else 0.04
 
 
 def viz_filtered_stcs(
@@ -30,12 +40,14 @@ def viz_filtered_stcs(
     visual_labels=None,
     mode="snapshot",
     n_snapshots=5,
+    hemi="split",
     views=("caudal", "medial"),
     show_evoked=None,
     occ_channels=None,
     save_dir=None,
     marker="peak",
     com_top_num=20,
+    foci_scale=None,
     **brain_kwargs,
 ):
     """Visualize filtered STC results as per-cycle snapshots or a video.
@@ -59,6 +71,10 @@ def viz_filtered_stcs(
         "video" saves a 0.5-second movie at 0.2× real-time (5× time dilation).
     n_snapshots : int
         Number of snapshots within one cycle (mode="snapshot" only).
+    hemi : {"split", "rh", "lh"}
+        Which hemisphere(s) to render. "rh" and "lh" produce a compact single-column
+        layout; "split" produces the two-column side-by-side layout.
+        Size, colorbar thickness, and foci scale are auto-adjusted unless overridden.
     views : sequence of str
         Brain surface views, e.g. ("caudal", "medial").
     show_evoked : bool or None
@@ -78,6 +94,9 @@ def viz_filtered_stcs(
     com_top_num : int
         Number of top-activated rh vertices used to compute the COM centroid
         (only relevant when marker="com").
+    foci_scale : float or None
+        Scale factor for the focus sphere marker. None = auto (1.2 for single-hemi,
+        0.6 for split).
     **brain_kwargs
         Forwarded to stc.plot(), overriding built-in defaults (background, size, etc.).
     """
@@ -85,8 +104,12 @@ def viz_filtered_stcs(
         visual_labels = []
     if show_evoked is None:
         show_evoked = (mode == "snapshot")
+    if foci_scale is None:
+        foci_scale = _auto_foci_scale(hemi)
 
-    brain_cfg = {**_BRAIN_DEFAULTS, **brain_kwargs}
+    # size: use explicit brain_kwargs override, otherwise auto from hemi
+    size = brain_kwargs.pop("size", None) or _auto_brain_size(hemi)
+    brain_cfg = {**_BRAIN_DEFAULTS, **brain_kwargs, "size": size}
 
     for label, result in filtered_stcs.items():
         stc            = result["stc"]
@@ -111,16 +134,17 @@ def viz_filtered_stcs(
             if mode == "snapshot":
                 _render_snapshots(
                     stc, snap_info, label, base_freq, inverse_method,
-                    subjects_dir, views, visual_labels, save_dir, brain_cfg,
-                    marker, com_top_num,
+                    subjects_dir, hemi, views, visual_labels, save_dir, brain_cfg,
+                    marker, com_top_num, foci_scale,
                 )
             else:
                 _render_video(
                     stc, label, base_freq, inverse_method,
-                    subjects_dir, views, visual_labels, save_dir, brain_cfg,
+                    subjects_dir, hemi, views, visual_labels, save_dir, brain_cfg,
+                    marker, com_top_num, foci_scale,
                 )
         else:
-            _open_interactive(stc, subjects_dir, views, visual_labels, brain_cfg)
+            _open_interactive(stc, subjects_dir, hemi, views, visual_labels, brain_cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -197,20 +221,21 @@ def _plot_evoked_diagnostic(evoked_filt, label, base_freq, harmonics_type,
         plt.show()
 
 
-def _make_brain(stc, subjects_dir, views, initial_time, time_viewer, brain_cfg):
+def _make_brain(stc, subjects_dir, hemi, views, initial_time, time_viewer, brain_cfg):
     kwargs = {
         **brain_cfg,
         "subjects_dir": subjects_dir,
+        "hemi":         hemi,
         "views":        list(views),
         "initial_time": initial_time,
         "time_unit":    "s",
         "time_viewer":  time_viewer,
     }
     brain = stc.plot(**kwargs)
-    # Reposition colorbar to bottom (horizontal bar overlaps panels when time_viewer=False)
+    # Reposition colorbar to bottom; thicker for single-hemi layouts
     sb = brain.plotter.scalar_bar
     sb.SetPosition(0.1, 0.02)
-    sb.SetPosition2(0.8, 0.04)
+    sb.SetPosition2(0.8, _auto_cbar_height(hemi))
     sb.GetLabelTextProperty().SetFontSize(7)
     sb.GetTitleTextProperty().SetFontSize(7)
     return brain
@@ -245,8 +270,39 @@ def _get_com_vertex(stc, t_idx, subjects_dir, com_top_num):
     return ("rh", int(rh_src_verts[nearest]))
 
 
+def _get_com_vertex_fulltime(stc, subjects_dir, com_top_num):
+    """Weighted COM of the top-N rh source vertices aggregated over the full epoch.
+
+    Uses abs_sum over all time points (same method as compute_com_over_time in
+    analyze_src_loc.py with method='abs_sum'), but restricted to rh only so the
+    returned FS vertex number is unambiguous.
+
+    Returns (hemi_str, fs_vertex_number) or None.
+    """
+    # abs_sum of |activation| over all time points → per-vertex weight
+    rh_agg = np.sum(np.abs(stc.rh_data), axis=1)
+    if rh_agg.max() <= 0:
+        return None
+
+    rh_src_verts = stc.vertices[1]
+    n = min(com_top_num, len(rh_agg))
+    top_idx = np.argsort(rh_agg)[-n:]
+    weights = rh_agg[top_idx]
+    weights = weights / weights.sum()
+
+    surf_path = os.path.join(subjects_dir, stc.subject, "surf", "rh.mid")
+    rh_coords, _ = read_surface(surf_path)
+    rh_src_coords = rh_coords[rh_src_verts]
+
+    centroid = (weights[:, np.newaxis] * rh_src_coords[top_idx]).sum(axis=0)
+
+    tree = cKDTree(rh_src_coords)
+    _, nearest = tree.query(centroid, k=1)
+    return ("rh", int(rh_src_verts[nearest]))
+
+
 def _get_marker_vertex(stc, t_idx, subjects_dir, marker, com_top_num):
-    """Return (hemi, fs_vertno) for the chosen marker strategy, or None."""
+    """Return (hemi, fs_vertno) for the chosen marker strategy at a single time point, or None."""
     if marker == "peak":
         rh_data_t = stc.rh_data[:, t_idx]
         if rh_data_t.max() > 0:
@@ -257,29 +313,49 @@ def _get_marker_vertex(stc, t_idx, subjects_dir, marker, com_top_num):
     return None  # marker=None → no foci
 
 
+def _get_video_marker_vertex(stc, subjects_dir, marker, com_top_num):
+    """Return (hemi, fs_vertno) for the video static marker (computed over the full epoch).
+
+    marker="peak" uses MNE's get_peak over the full epoch (positive values only).
+    marker="com"  uses abs_sum COM over the full epoch via _get_com_vertex_fulltime.
+    """
+    if marker == "peak":
+        try:
+            vertno, _ = stc.get_peak(hemi="rh", mode="pos",
+                                     tmin=stc.tmin, tmax=stc.times[-1],
+                                     vert_as_index=False)
+            return ("rh", int(vertno))
+        except Exception:
+            return None
+    if marker == "com":
+        return _get_com_vertex_fulltime(stc, subjects_dir, com_top_num)
+    return None
+
+
 def _add_overlays(brain, stc, t_idx, visual_labels,
-                  subjects_dir=None, marker="peak", com_top_num=20):
+                  subjects_dir=None, marker="peak", com_top_num=20, foci_scale=0.6):
     """Add focus marker and anatomical label borders at a given time index."""
     result = _get_marker_vertex(stc, t_idx, subjects_dir, marker, com_top_num)
     if result is not None:
         hemi, vertno = result
         brain.add_foci(vertno, coords_as_verts=True, hemi=hemi,
-                       color="limegreen", scale_factor=0.6, alpha=0.8)
+                       color="limegreen", scale_factor=foci_scale, alpha=0.8)
     for vl, color in visual_labels:
         brain.add_label(vl, borders=True, color=color)
 
 
 def _render_snapshots(stc, snap_info, label, base_freq, inverse_method,
-                       subjects_dir, views, visual_labels, save_dir, brain_cfg,
-                       marker, com_top_num):
+                       subjects_dir, hemi, views, visual_labels, save_dir, brain_cfg,
+                       marker, com_top_num, foci_scale):
     for snap_t in snap_info["times"]:
         t_idx    = np.argmin(np.abs(stc.times - snap_t))
         t_actual = stc.times[t_idx]
 
-        brain = _make_brain(stc, subjects_dir, views, t_actual,
+        brain = _make_brain(stc, subjects_dir, hemi, views, t_actual,
                              time_viewer=False, brain_cfg=brain_cfg)
         _add_overlays(brain, stc, t_idx, visual_labels,
-                      subjects_dir=subjects_dir, marker=marker, com_top_num=com_top_num)
+                      subjects_dir=subjects_dir, marker=marker,
+                      com_top_num=com_top_num, foci_scale=foci_scale)
 
         t_ms = t_actual * 1000
         brain.add_text(0.1, 0.9,
@@ -292,14 +368,28 @@ def _render_snapshots(stc, snap_info, label, base_freq, inverse_method,
         brain.close()
 
 
-def _render_video(stc, label, base_freq, inverse_method, subjects_dir, views,
-                   visual_labels, save_dir, brain_cfg):
-    """Save a 0.5-second video at 0.2× real-time (time_dilation=5)."""
+def _render_video(stc, label, base_freq, inverse_method, subjects_dir, hemi, views,
+                   visual_labels, save_dir, brain_cfg, marker, com_top_num, foci_scale):
+    """Save a 0.5-second video at 0.2x real-time.
+
+    time_dilation=5 stretches each real second to 5 video seconds:
+    0.5s of data -> 2.5s of video (5x slower = 0.2x real-time speed).
+    The foci marker is static (computed once over the full epoch) and persists
+    through all frames.
+    """
     t_start = stc.tmin
     t_end   = min(stc.tmin + 0.5, stc.times[-1])
 
-    brain = _make_brain(stc, subjects_dir, views, t_start,
+    brain = _make_brain(stc, subjects_dir, hemi, views, t_start,
                          time_viewer=False, brain_cfg=brain_cfg)
+
+    # Static marker: peak or COM over the full epoch (not just the 0.5s clip)
+    marker_result = _get_video_marker_vertex(stc, subjects_dir, marker, com_top_num)
+    if marker_result is not None:
+        m_hemi, m_vertno = marker_result
+        brain.add_foci(m_vertno, coords_as_verts=True, hemi=m_hemi,
+                       color="limegreen", scale_factor=foci_scale, alpha=0.8)
+
     for vl, color in visual_labels:
         brain.add_label(vl, borders=True, color=color)
     brain.add_text(0.1, 0.9, f"{inverse_method}: {label} | {base_freq} Hz",
@@ -312,9 +402,9 @@ def _render_video(stc, label, base_freq, inverse_method, subjects_dir, views,
     brain.close()
 
 
-def _open_interactive(stc, subjects_dir, views, visual_labels, brain_cfg):
+def _open_interactive(stc, subjects_dir, hemi, views, visual_labels, brain_cfg):
     """Open an interactive Brain window (no saving)."""
-    brain = _make_brain(stc, subjects_dir, views, stc.tmin,
+    brain = _make_brain(stc, subjects_dir, hemi, views, stc.tmin,
                          time_viewer=True, brain_cfg=brain_cfg)
     for vl, color in visual_labels:
         brain.add_label(vl, borders=True, color=color)
